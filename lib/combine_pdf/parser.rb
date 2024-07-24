@@ -34,6 +34,7 @@ module CombinePDF
     attr_reader :info_object, :root_object, :names_object, :forms_object, :outlines_object, :metadata
 
     attr_reader :allow_optional_content, :raise_on_encrypted
+    attr_reader :check_stream_length
     # when creating a parser, it is important to set the data (String) we wish to parse.
     #
     # <b>the data is required and it is not possible to set the data at a later stage</b>
@@ -59,6 +60,7 @@ module CombinePDF
       @scanner = nil
       @allow_optional_content = options[:allow_optional_content]
       @raise_on_encrypted = options[:raise_on_encrypted]
+      @check_stream_length = options[:check_stream_length]
     end
 
     # parse the data in the new parser (the data already set through the initialize / new method)
@@ -226,40 +228,40 @@ module CombinePDF
         # end unless (last == out.count) || (-1 == (last = out.count))
         if @scanner.scan(/\[/)
           out << _parse_
-        ##########################################
-        ## Parse a Name
-        ##########################################
-        # old, probably working version: when str = @scanner.scan(/\/[\#\w\d\.\+\-\\\?\,]+/)
-        # I don't know how to write the /[\x21-\x7e___subtract_certain_hex_values_here____]+/
-        # all allowed regular caracters between ! and ~ : /[\x21-\x24\x26\x27\x2a-\x2e\x30-\x3b\x3d\x3f-\x5a\x5c\x5e-\x7a\x7c\x7e]+
-        # all characters that aren't white space or special: /[^\x00\x09\x0a\x0c\x0d\x20\x28\x29\x3c\x3e\x5b\x5d\x7b\x7d\x2f\x25]+
+          ##########################################
+          ## Parse a Name
+          ##########################################
+          # old, probably working version: when str = @scanner.scan(/\/[\#\w\d\.\+\-\\\?\,]+/)
+          # I don't know how to write the /[\x21-\x7e___subtract_certain_hex_values_here____]+/
+          # all allowed regular caracters between ! and ~ : /[\x21-\x24\x26\x27\x2a-\x2e\x30-\x3b\x3d\x3f-\x5a\x5c\x5e-\x7a\x7c\x7e]+
+          # all characters that aren't white space or special: /[^\x00\x09\x0a\x0c\x0d\x20\x28\x29\x3c\x3e\x5b\x5d\x7b\x7d\x2f\x25]+
         elsif str = @scanner.scan(/\/[^\x00\x09\x0a\x0c\x0d\x20\x28\x29\x3c\x3e\x5b\x5d\x7b\x7d\x2f\x25]*/)
           out << (str[1..-1].gsub(/\#[0-9a-fA-F]{2}/) { |a| a[1..2].hex.chr }).to_sym
           # warn "CombinePDF detected name: #{out.last.to_s}"
-        ##########################################
-        ## Parse a Number
-        ##########################################
+          ##########################################
+          ## Parse a Number
+          ##########################################
         elsif str = @scanner.scan(/[\+\-\.\d]+/)
           str =~ /\./ ? (out << str.to_f) : (out << str.to_i)
           # warn "CombinePDF detected number: #{out.last.to_s}"
-        ##########################################
-        ## parse a Hex String
-        ##########################################
+          ##########################################
+          ## parse a Hex String
+          ##########################################
         elsif str = @scanner.scan(/\<[0-9a-fA-F]*\>/)
           # warn "Found a hex string #{str}"
           str = str.slice(1..-2).force_encoding(Encoding::ASCII_8BIT)
           # str = "0#{str}" if str.length.odd?
           out << unify_string([str].pack('H*').force_encoding(Encoding::ASCII_8BIT))
-        ##########################################
-        ## parse a space delimited Hex String
-        ##########################################
+          ##########################################
+          ## parse a space delimited Hex String
+          ##########################################
         elsif str = @scanner.scan(/\<[0-9a-fA-F\s]*\>/)
           # warn "Found a space seperated hex string"
           str = str.force_encoding(Encoding::ASCII_8BIT).split(/\s/).map! {|b| b.length.odd? ? "0#{b}" : b}
           out << unify_string(str.pack('H*' * str.length).force_encoding(Encoding::ASCII_8BIT))
-        ##########################################
-        ## parse a Literal String
-        ##########################################
+          ##########################################
+          ## parse a Literal String
+          ##########################################
         elsif @scanner.scan(/\(/)
           # warn "Found a literal string"
           str = ''.b
@@ -341,35 +343,39 @@ module CombinePDF
           end
           out << unify_string(str.pack('C*').force_encoding(Encoding::ASCII_8BIT))
           # warn "Found Literal String: #{out.last}"
-        ##########################################
-        ## parse a Dictionary
-        ##########################################
+          ##########################################
+          ## parse a Dictionary
+          ##########################################
         elsif @scanner.scan(/<</)
           data = _parse_
           obj = {}
           obj[data.shift] = data.shift while data[0]
           out << obj
-        ##########################################
-        ## return content of array or dictionary
-        ##########################################
+          ##########################################
+          ## return content of array or dictionary
+          ##########################################
         elsif @scanner.scan(/\]/) || @scanner.scan(/>>/)
           # warn "Dictionary / Array ended with #{@scanner.peek(5)}"
           return out
-        ##########################################
-        ## parse a Stream
-        ##########################################
+          ##########################################
+          ## parse a Stream
+          ##########################################
         elsif @scanner.scan(/stream[ \t]*[\r\n]/)
           @scanner.pos += 1 if @scanner.peek(1) == "\n".freeze && @scanner.matched[-1] != "\n".freeze
           # advance by the publshed stream length (if any)
           old_pos = @scanner.pos
           if(out.last.is_a?(Hash) && out.last[:Length].is_a?(Integer) && out.last[:Length] > 2)
-            @scanner.pos += out.last[:Length] - 2
+            if @check_stream_length
+              advance_pos_with_length_check(@scanner, out.last[:Length], out.last)
+            else
+              @scanner.pos += out.last[:Length] - 2
+            end
           end
 
           # the following was dicarded because some PDF files didn't have an EOL marker as required
           # str = @scanner.scan_until(/(\r\n|\r|\n)endstream/)
           # instead, a non-strict RegExp is used:
-          
+
 
           # raise error if the stream doesn't end.
           unless @scanner.skip_until(/endstream/)
@@ -390,9 +396,9 @@ module CombinePDF
             warn 'Stream not attached to dictionary!'
             out << str.force_encoding(Encoding::ASCII_8BIT)
           end
-        ##########################################
-        ## parse an Object after finished
-        ##########################################
+          ##########################################
+          ## parse an Object after finished
+          ##########################################
         elsif str = @scanner.scan(/endobj/)
           # what to do when this is an object?
           if out.last.is_a? Hash
@@ -403,64 +409,64 @@ module CombinePDF
           fresh = true
           # fix wkhtmltopdf use of PDF 1.1 Dest using symbols instead of strings
           out.last[:Dest] = unify_string(out.last[:Dest].to_s) if out.last[:Dest] && out.last[:Dest].is_a?(Symbol)
-        # puts "!!!!!!!!! Error with :indirect_reference_id\n\nObject #{out.last}  :indirect_reference_id = #{out.last[:indirect_reference_id]}" unless out.last[:indirect_reference_id].is_a?(Numeric)
-        ##########################################
-        ## Parse an Object Reference
-        ##########################################
+          # puts "!!!!!!!!! Error with :indirect_reference_id\n\nObject #{out.last}  :indirect_reference_id = #{out.last[:indirect_reference_id]}" unless out.last[:indirect_reference_id].is_a?(Numeric)
+          ##########################################
+          ## Parse an Object Reference
+          ##########################################
         elsif @scanner.scan(/R/)
           out << { is_reference_only: true, indirect_generation_number: out.pop, indirect_reference_id: out.pop }
-        # @references << out.last
-        ##########################################
-        ## Parse Bool - true and after false
-        ##########################################
+          # @references << out.last
+          ##########################################
+          ## Parse Bool - true and after false
+          ##########################################
         elsif @scanner.scan(/true/)
           out << true
         elsif @scanner.scan(/false/)
           out << false
-        ##########################################
-        ## Parse NULL - null
-        ##########################################
+          ##########################################
+          ## Parse NULL - null
+          ##########################################
         elsif @scanner.scan(/null/)
           out << nil
-        ##########################################
-        ## Parse file trailer
-        ##########################################
+          ##########################################
+          ## Parse file trailer
+          ##########################################
         elsif @scanner.scan(/trailer/)
           if @scanner.skip_until(/<</)
             data = _parse_
             (@root_object ||= {}).clear
             @root_object[data.shift] = data.shift while data[0]
           end
-        ##########################################
-        ## XREF - check for encryption... anything else?
-        ##########################################
+          ##########################################
+          ## XREF - check for encryption... anything else?
+          ##########################################
         elsif @scanner.scan(/xref/)
           # skip list indetifier lines or list lines ([\d] [\d][\r\n]) ot ([\d] [\d] [nf][\r\n])
           while @scanner.scan(/[\s]*[\d]+[ \t]+[\d]+[ \t]*[\n\r]+/) || @scanner.scan(/[ \t]*[\d]+[ \t]+[\d]+[ \t]+[nf][\s]*/)
             nil
           end
-        ##########################################
-        ## XREF location can be ignored
-        ##########################################
+          ##########################################
+          ## XREF location can be ignored
+          ##########################################
         elsif @scanner.scan(/startxref/)
           @scanner.scan(/[\s]+[\d]+[\s]+/)
-        ##########################################
-        ## Skip Whitespace
-        ##########################################
+          ##########################################
+          ## Skip Whitespace
+          ##########################################
         elsif @scanner.scan(/[\s]+/)
           # Generally, do nothing
           nil
-        ##########################################
-        ## EOF?
-        ##########################################
+          ##########################################
+          ## EOF?
+          ##########################################
         elsif @scanner.scan(/\%\%EOF/)
           ##########
           ## If this was the last valid segment, ignore any trailing garbage
           ## (issue #49 resolution)
           break unless @scanner.exist?(/\%\%EOF/)
-        ##########################################
-        ## Parse a comment
-        ##########################################
+          ##########################################
+          ## Parse a comment
+          ##########################################
         elsif str = @scanner.scan(/\%/)
           # is a comment, skip until new line
           loop do
@@ -468,10 +474,10 @@ module CombinePDF
             break if @scanner.check(/([\d]+[\s]+[\d]+[\s]+obj[\s]+\<\<)|([\n\r]+)/) || @scanner.eos? # || @scanner.scan(/[^\d]+[\r\n]+/) ||
             @scanner.scan(/[^\d\r\n]+/) || @scanner.pos += 1
           end
-        # puts "AFTER COMMENT: #{@scanner.peek 8}"
-        ##########################################
-        ## Fix wkhtmltopdf - missing 'endobj' keywords
-        ##########################################
+          # puts "AFTER COMMENT: #{@scanner.peek 8}"
+          ##########################################
+          ## Fix wkhtmltopdf - missing 'endobj' keywords
+          ##########################################
         elsif @scanner.scan(/obj[\s]*/)
           # Fix wkhtmltopdf PDF authoring issue - missing 'endobj' keywords
           unless fresh || (out[-4].nil? || out[-4].is_a?(Hash))
@@ -492,9 +498,9 @@ module CombinePDF
             out << keep.pop
           end
           fresh = false
-        ##########################################
-        ## Unknown, warn and advance
-        ##########################################
+          ##########################################
+          ## Unknown, warn and advance
+          ##########################################
         else
           # always advance
           # warn "Advancing for unknown reason... #{@scanner.string[@scanner.pos - 4, 8]} ... #{@scanner.peek(4)}" unless @scanner.peek(1) =~ /[\s\n]/
@@ -506,6 +512,29 @@ module CombinePDF
     end
 
     protected
+
+    def advance_pos_with_length_check(scanner, length, obj)
+      endstream = 'endstream'
+      orig_pos = scanner.pos
+      if scanner.rest_size > length
+        scanner.pos += length
+        if scanner.check(endstream)
+          scanner.pos -= 2
+          return
+        end
+        warn "Invalid length no #{endstream} found - object: #{obj}!"
+      else
+        warn "Invalid length in stream points out of the file - object: #{obj}!"
+      end
+      scanner.pos = orig_pos
+      skipped = scanner.skip_until(/endstream/)
+      if skipped
+        correct_len = skipped - endstream.length
+        scanner.pos -= endstream.length + 2
+      else
+        raise ParsingError, "Parsing Error: PDF file error - a stream object with invalid length of #{length} for object #{out} and no #{endstream} found after, to work around it"
+      end
+    end
 
     # resets cataloging and pages
     def catalog_pages(catalogs = nil, inheritance_hash = {})
